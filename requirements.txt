@@ -1,0 +1,8 @@
+frida==16.1.4
+pymem
+pydirectinput
+pyautogui
+bresenham
+pynput
+ttkthemes
+pywin32

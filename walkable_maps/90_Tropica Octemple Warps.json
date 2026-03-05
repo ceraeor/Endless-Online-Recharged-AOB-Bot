@@ -1,0 +1,169 @@
+{
+    "warp_tiles": [
+        {
+            "x": 17,
+            "y": 8,
+            "spec": 1,
+            "door": 0,
+            "unk": 0,
+            "questid": 66,
+            "destination_id": 91,
+            "destination_x": 22,
+            "destination_y": 48
+        },
+        {
+            "x": 18,
+            "y": 8,
+            "spec": 1,
+            "door": 0,
+            "unk": 0,
+            "questid": 66,
+            "destination_id": 91,
+            "destination_x": 23,
+            "destination_y": 48
+        },
+        {
+            "x": 19,
+            "y": 8,
+            "spec": 1,
+            "door": 0,
+            "unk": 0,
+            "questid": 66,
+            "destination_id": 91,
+            "destination_x": 24,
+            "destination_y": 48
+        },
+        {
+            "x": 20,
+            "y": 8,
+            "spec": 1,
+            "door": 0,
+            "unk": 0,
+            "questid": 66,
+            "destination_id": 91,
+            "destination_x": 25,
+            "destination_y": 48
+        },
+        {
+            "x": 21,
+            "y": 8,
+            "spec": 1,
+            "door": 0,
+            "unk": 0,
+            "questid": 66,
+            "destination_id": 91,
+            "destination_x": 26,
+            "destination_y": 48
+        },
+        {
+            "x": 22,
+            "y": 8,
+            "spec": 1,
+            "door": 0,
+            "unk": 0,
+            "questid": 66,
+            "destination_id": 91,
+            "destination_x": 26,
+            "destination_y": 48
+        },
+        {
+            "x": 16,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 15,
+            "destination_y": 1
+        },
+        {
+            "x": 17,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 16,
+            "destination_y": 1
+        },
+        {
+            "x": 18,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 17,
+            "destination_y": 1
+        },
+        {
+            "x": 19,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 18,
+            "destination_y": 1
+        },
+        {
+            "x": 20,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 19,
+            "destination_y": 1
+        },
+        {
+            "x": 21,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 20,
+            "destination_y": 1
+        },
+        {
+            "x": 22,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 21,
+            "destination_y": 1
+        },
+        {
+            "x": 23,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 22,
+            "destination_y": 1
+        },
+        {
+            "x": 24,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 89,
+            "destination_x": 23,
+            "destination_y": 1
+        }
+    ]
+}

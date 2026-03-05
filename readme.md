@@ -289,3 +289,6 @@ See LICENSE for more information.
 ------------------------------------------------------------
 
 Created by ceraeor
+
+Join the Discord! 
+https://discord.gg/TxEttS4jNe

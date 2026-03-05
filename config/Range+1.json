@@ -1,0 +1,93 @@
+{
+  "BOSS_AGGRO_TOGGLE": true,
+  "SIT_TIMER_SECONDS": 70,
+  "LAST_MOVED_TIMER_SECONDS": 35,
+  "MOB_ID_FILTERS": [
+    15,
+    84,
+    188,
+    285,
+    286,
+    292,
+    301,
+    302,
+    305,
+    319,
+    321,
+    324,
+    325,
+    412,
+    413,
+    417,
+    421,
+    422,
+    502,
+    511,
+    512,
+    513,
+    514,
+    538,
+    543,
+    672,
+    754
+  ],
+  "HOME_POS": [
+    3,
+    12
+  ],
+  "FLANK_RANGE": 2,
+  "RUN_HOME_AFTER_KILL": true,
+  "CLICKING_ENABLED": true,
+  "FAST_CLICK": false,
+  "FAST_CLICK_BURST_COUNT": 3,
+  "FAST_CLICK_GAP_S": 0.12,
+  "CLICK_BUFFS_ENABLED": false,
+  "CLICK_BUFF_INTERVAL_S": 20.0,
+  "HP_BUFFS_ENABLED": false,
+  "HP_BUFF_THRESHOLD_PCT": 40.0,
+  "IGNORE_PROTECTION": false,
+  "F5_TAP_COUNT": 24,
+  "WANDER_TIMEOUT_S": 15.0,
+  "HOME_AFTER_KILLS_N": 1,
+  "AVOID_OTHER_PLAYERS": false,
+  "HP_HOME_ENABLED": false,
+  "HP_HOME_LOW_PCT": 30.0,
+  "HP_HOME_HIGH_PCT": 60.0,
+  "HP_BUFF_TARGET_PCT": 60.0,
+  "HP_BUFF_COOLDOWN_S": 1.0,
+  "AUTO_LOAD_MAP_BY_ID": false,
+  "START_MAP_ID": null,
+  "RESURRECT_POINTS": [
+    [
+      340,
+      140
+    ],
+    [
+      340,
+      173
+    ],
+    [
+      278,
+      173
+    ],
+    [
+      277,
+      140
+    ]
+  ],
+  "PLAYER_CLICK_POINT": [
+    311,
+    157
+  ],
+  "DARK_MODE": true,
+  "HOTKEY_BINDINGS": {
+    "mine": "f1",
+    "chop": "f2",
+    "hp_buff": "f3",
+    "buff": "f5",
+    "buff_self": "f6",
+    "sit_cancel": "f7",
+    "weapon": "f8",
+    "stand": "f11"
+  }
+}

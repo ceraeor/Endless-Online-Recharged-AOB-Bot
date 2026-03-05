@@ -1,0 +1,26 @@
+{
+    "warp_tiles": [
+        {
+            "x": 8,
+            "y": 19,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 258,
+            "destination_x": 47,
+            "destination_y": 24
+        },
+        {
+            "x": 8,
+            "y": 20,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 258,
+            "destination_x": 47,
+            "destination_y": 24
+        }
+    ]
+}

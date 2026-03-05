@@ -1,0 +1,92 @@
+{
+    "warp_tiles": [
+        {
+            "x": 3,
+            "y": 19,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 314,
+            "destination_x": 7,
+            "destination_y": 19
+        },
+        {
+            "x": 6,
+            "y": 19,
+            "spec": 3,
+            "door": 1,
+            "unk": 0,
+            "questid": 6,
+            "destination_id": 0,
+            "destination_x": 0,
+            "destination_y": 0
+        },
+        {
+            "x": 3,
+            "y": 20,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 314,
+            "destination_x": 7,
+            "destination_y": 20
+        },
+        {
+            "x": 6,
+            "y": 20,
+            "spec": 3,
+            "door": 1,
+            "unk": 0,
+            "questid": 6,
+            "destination_id": 0,
+            "destination_x": 0,
+            "destination_y": 0
+        },
+        {
+            "x": 3,
+            "y": 25,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 312,
+            "destination_x": 7,
+            "destination_y": 25
+        },
+        {
+            "x": 6,
+            "y": 25,
+            "spec": 3,
+            "door": 1,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 0,
+            "destination_x": 0,
+            "destination_y": 0
+        },
+        {
+            "x": 3,
+            "y": 26,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 312,
+            "destination_x": 7,
+            "destination_y": 26
+        },
+        {
+            "x": 6,
+            "y": 26,
+            "spec": 3,
+            "door": 1,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 0,
+            "destination_x": 0,
+            "destination_y": 0
+        }
+    ]
+}

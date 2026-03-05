@@ -1,0 +1,59 @@
+{
+    "warp_tiles": [
+        {
+            "x": 56,
+            "y": 10,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 153,
+            "destination_x": 35,
+            "destination_y": 59
+        },
+        {
+            "x": 57,
+            "y": 10,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 153,
+            "destination_x": 36,
+            "destination_y": 59
+        },
+        {
+            "x": 58,
+            "y": 10,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 153,
+            "destination_x": 37,
+            "destination_y": 59
+        },
+        {
+            "x": 51,
+            "y": 58,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 154,
+            "destination_x": 68,
+            "destination_y": 67
+        },
+        {
+            "x": 52,
+            "y": 72,
+            "spec": 0,
+            "door": 0,
+            "unk": 0,
+            "questid": 0,
+            "destination_id": 154,
+            "destination_x": 53,
+            "destination_y": 58
+        }
+    ]
+}

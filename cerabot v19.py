@@ -17,6 +17,7 @@ import os, sys
 from collections import deque
 import re
 import copy
+import shutil
 import ctypes
 from ctypes import wintypes
 from tkinter import messagebox, simpledialog
@@ -34,6 +35,62 @@ def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+def _resource_base_dir() -> Path:
+    """Return the bundled resource folder (PyInstaller temp dir when onefile)."""
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(str(meipass)).resolve()
+    return _app_base_dir()
+
+def _copy_missing_files(src_dir: Path, dst_dir: Path):
+    """Copy bundled defaults into writable runtime dirs without overwriting user files."""
+    try:
+        if not src_dir.is_dir():
+            return
+    except Exception:
+        return
+
+    try:
+        if src_dir.resolve() == dst_dir.resolve():
+            return
+    except Exception:
+        pass
+
+    for src_file in src_dir.rglob("*"):
+        try:
+            if not src_file.is_file():
+                continue
+            rel = src_file.relative_to(src_dir)
+            dst_file = dst_dir / rel
+            if dst_file.exists():
+                continue
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst_file)
+        except Exception:
+            pass
+
+def _seed_runtime_data_dirs(app_base_dir: Path, resource_base_dir: Path, config_dir: Path, walkable_maps_dir: Path):
+    """
+    For frozen builds, pre-populate writable runtime folders from bundled assets.
+    Keeps user-edited files persistent beside the EXE.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        walkable_maps_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    for cfg_name in ("config", "Config"):
+        _copy_missing_files(resource_base_dir / cfg_name, config_dir)
+    _copy_missing_files(resource_base_dir / "walkable_maps", walkable_maps_dir)
 BOT_GUI = None  # Global reference to the GUI instance
 pydirectinput.FAILSAFE = False  # Disable fail-safe to allow corner screen interactions
 pyautogui.PAUSE = 0
@@ -53,8 +110,6 @@ HP_AOB = "89 B4 8B F0 01 00 00"
 MANA_AOB = "89 B4 8B 88 03 00 00"
 OTHER_PLAYERS_AOB = "66 89 91 50 01 00 00"
 MAP_ID_AOB = "89 4B 14 8B 85 1C FF FF FF 89 43 1C"
-# Session kill counter path: ... call <fn>; inc dword ptr [ebx+10]
-KILL_COUNTER_AOB = "8B D7 E8 ?? ?? ?? ?? FF 43 10 8B C3 8B 10 FF 52 70"
 
 NPC_ADD1_AOB = "66 01 81 A0 00 00 00"
 NPC_ADD2_AOB = "66 01 82 A2 00 00 00"
@@ -104,7 +159,6 @@ x_address = None
 y_address = None
 directional_address = None
 mapIdAddress = None
-killCounterAddress = None
 current_target_npc = None
 pm = None  # Global pymem instance
 stat_base = None  
@@ -146,11 +200,13 @@ _target_immunity_until = {}  # addr_hex -> monotonic deadline
 BOSS_AGGRO_TOGGLE = True  # <<< Toggle for boss aggro detection during sitting
 SIT_TIMER_SECONDS = 70   # <<< Configurable sit timer in seconds
 APP_BASE_DIR = _app_base_dir()
+RESOURCE_BASE_DIR = _resource_base_dir()
 WALKABLE_MAPS_DIR = APP_BASE_DIR / "walkable_maps"
 CONFIG_DIR = APP_BASE_DIR / "config"
 DEFAULT_CONFIG_FILE_NAME = "cerabot_config.json"
 LEGACY_CONFIG_FILE_NAME = "cerafrog_config.json"
 CONFIG_FILE = str((CONFIG_DIR / DEFAULT_CONFIG_FILE_NAME).resolve())  # Active config file path
+_seed_runtime_data_dirs(APP_BASE_DIR, RESOURCE_BASE_DIR, CONFIG_DIR, WALKABLE_MAPS_DIR)
 KILL_QUARANTINE_SEC = 1.0        # keep a killed NPC muted for ~8s (prevents re-targeting during home routine)
 RECENTLY_KILLED: Dict[str, float] = {}  # addr_hex -> time.monotonic()
 _last_kill_ts: Dict[str, float] = {}
@@ -173,8 +229,6 @@ _MANA_FRIDA_SESSION = None
 _MANA_FRIDA_SCRIPT  = None  # Keep Python-side reference so hook script is not GC'd.
 _MAP_ID_FRIDA_SESSION = None
 _MAP_ID_FRIDA_SCRIPT = None
-_KILL_COUNTER_FRIDA_SESSION = None
-_KILL_COUNTER_FRIDA_SCRIPT = None
 NO_CLICK_UNTIL = 0.0
 CLICK_BUFFS_ENABLED    = False       # GUI toggle
 CLICK_BUFF_INTERVAL_S  = 20.0        # seconds between F6 self-buff clicks
@@ -649,10 +703,13 @@ class _EmbeddedFridaInput:
 
     def _script_path(self) -> Optional[Path]:
         base = _app_base_dir()
+        resource_base = _resource_base_dir()
         candidates = [
             base / "input_spoofer.js",
+            resource_base / "input_spoofer.js",
             Path.cwd() / "input_spoofer.js",
             base / "bot-v18.6-eco" / "input_spoofer.js",
+            resource_base / "bot-v18.6-eco" / "input_spoofer.js",
             Path.cwd() / "bot-v18.6-eco" / "input_spoofer.js",
         ]
         for p in candidates:
@@ -2003,7 +2060,7 @@ def read_stat(name):
     Special handling for current_hp/current_mana which come from Frida hooks.
     """
     global stat_base, CURRENT_HP, CURRENT_MANA
-    if stat_base is None and name not in ('current_hp', 'current_mana', 'session_kills'):
+    if stat_base is None and name not in ('current_hp', 'current_mana'):
         return None
     
     if name == 'current_hp':
@@ -2017,12 +2074,6 @@ def read_stat(name):
             return CURRENT_MANA  # Atomic read, no lock needed
         except Exception:
             return None
-
-    if name == 'session_kills':
-        try:
-            return read_session_kills()
-        except Exception:
-            return 0
     
     addr = stat_base + STAT_OFFSETS[name]
     try:
@@ -2039,7 +2090,6 @@ def read_all_stats():
         stats[k] = read_stat(k)
     stats['current_hp'] = read_current_hp()
     stats['current_mana'] = read_current_mana()
-    stats['session_kills'] = read_session_kills()
     return stats
 
 def _normalize_direction(raw_dir: Any) -> int:
@@ -2429,6 +2479,9 @@ def on_message_exp(message, data):
             try:
                 stat_base = int(base_str, 16)
                 start_weight_lock()
+                if current_target_npc:
+                    _fire_kill_once(current_target_npc, reason="EXP-HOOK")
+                    
             except Exception as e:
                 _log_warn(f"[frida] Failed to parse stat base: {e}")
 
@@ -2458,51 +2511,6 @@ def on_message_mana(message, data):
     value = _on_message_scalar(message, payload_key='mana', err_tag='mana')
     if value is not None:
         CURRENT_MANA = value
-
-def on_message_total_kills(message, data):
-    """Lock one dynamic counter address from the hook, then monitor it directly."""
-    global KILL_COUNTER_MONITOR_ADDR, KILL_COUNTER_MONITOR_PTR, KILL_COUNTER_LAST_VALUE
-    if message.get('type') == 'send':
-        payload = message.get('payload', {})
-        addr = payload.get('kills_addr')
-        if not addr:
-            return
-
-        addr_str = str(addr)
-        try:
-            cand_ptr = int(addr_str, 16)
-        except Exception:
-            return
-        if cand_ptr <= 0x10000:
-            return
-
-        if KILL_COUNTER_MONITOR_PTR is None:
-            KILL_COUNTER_MONITOR_ADDR = addr_str
-            KILL_COUNTER_MONITOR_PTR = int(cand_ptr)
-            _log_info(f"[KILLS] Monitoring dynamic counter @ {KILL_COUNTER_MONITOR_ADDR}")
-            try:
-                if pm is not None:
-                    KILL_COUNTER_LAST_VALUE = int(pm.read_int(int(KILL_COUNTER_MONITOR_PTR)))
-            except Exception:
-                KILL_COUNTER_LAST_VALUE = None
-    elif message.get('type') == 'error':
-        return
-
-    if KILL_COUNTER_MONITOR_PTR is None or pm is None:
-        return
-    try:
-        cur_val = int(pm.read_int(int(KILL_COUNTER_MONITOR_PTR)))
-    except Exception:
-        return
-    if cur_val < 0:
-        return
-
-    prev_val = KILL_COUNTER_LAST_VALUE
-    KILL_COUNTER_LAST_VALUE = cur_val
-    if prev_val is None:
-        return
-    if cur_val > int(prev_val) and current_target_npc:
-        _fire_kill_once(current_target_npc, reason="KILLS-COUNTER")
 
 def _on_kill(addr_hex: str, reason: str):
     global current_target_npc, KILLS_SINCE_HOME, vanish_timer  # must be declared at the very top
@@ -2704,7 +2712,7 @@ def initialize_pymem():
 def resolve_all_aobs(timeout=5.0):
     """
     Universal Frida-based AOB resolver.
-    Resolves WALK, NPC, SPEECH, DIRECTIONAL, EXP, HP, MANA, OTHER_PLAYERS, MAP_ID, KILL_COUNTER.
+    Resolves WALK, NPC, SPEECH, DIRECTIONAL, EXP, HP, MANA, OTHER_PLAYERS, MAP_ID.
     Stores all as integer RVA offsets.
     """
 
@@ -2712,7 +2720,7 @@ def resolve_all_aobs(timeout=5.0):
 
     global walkAddress, npcAddress, speechAddress
     global directionalAddress, expAddress, hpAddress, manaAddress
-    global otherPlayersAddress, mapIdAddress, killCounterAddress
+    global otherPlayersAddress, mapIdAddress
 
     walkAddress = None
     npcAddress = None
@@ -2723,7 +2731,6 @@ def resolve_all_aobs(timeout=5.0):
     manaAddress = None
     otherPlayersAddress = None
     mapIdAddress = None
-    killCounterAddress = None
 
     session = frida_attach_target()
 
@@ -2767,7 +2774,6 @@ def resolve_all_aobs(timeout=5.0):
         const manaHit         = await scan("{MANA_AOB}", false);
         const otherPlayersHit = await scan("{OTHER_PLAYERS_AOB}", false);
         const mapIdHit        = await scan("{MAP_ID_AOB}", true);
-        const killCounterHit  = await scan("{KILL_COUNTER_AOB}", true);
 
         send({{
             type: "aob_results",
@@ -2780,8 +2786,7 @@ def resolve_all_aobs(timeout=5.0):
             hp: hpHit ? hpHit.toString() : null,
             mana: manaHit ? manaHit.toString() : null,
             other_players: otherPlayersHit ? otherPlayersHit.toString() : null,
-            map_id: mapIdHit ? mapIdHit.toString() : null,
-            kill_counter: killCounterHit ? killCounterHit.toString() : null
+            map_id: mapIdHit ? mapIdHit.toString() : null
         }});
     }}
 
@@ -2793,7 +2798,7 @@ def resolve_all_aobs(timeout=5.0):
     def on_aob_message(message, data):
         global walkAddress, npcAddress, speechAddress
         global directionalAddress, expAddress, hpAddress, manaAddress
-        global otherPlayersAddress, mapIdAddress, killCounterAddress
+        global otherPlayersAddress, mapIdAddress
 
         if message["type"] != "send":
             return
@@ -2829,9 +2834,6 @@ def resolve_all_aobs(timeout=5.0):
             otherPlayersAddress = int(payload["other_players"], 16) - base
         if payload.get("map_id"):
             mapIdAddress = int(payload["map_id"], 16) - base
-        if payload.get("kill_counter"):
-            # Signature starts 7 bytes before "inc dword ptr [ebx+0x10]"; hook exact inc instruction.
-            killCounterAddress = (int(payload["kill_counter"], 16) + 7) - base
 
         resolved["done"] = True
 
@@ -2871,10 +2873,6 @@ def resolve_all_aobs(timeout=5.0):
         _log_info("[AOB] MAP_ID        ->", hex(mapIdAddress))
     else:
         _log_warn("[AOB] MAP_ID signature not found; auto map-id loading unavailable.")
-    if isinstance(killCounterAddress, int):
-        _log_info("[AOB] KILL_COUNTER  ->", hex(killCounterAddress))
-    else:
-        _log_warn("[AOB] KILL_COUNTER signature not found; today's kill counter unavailable.")
 
     return True
 
@@ -3082,48 +3080,6 @@ def start_frida_current_mana():
         label="mana-hook",
         none_message="[MANA] No resolved RVA; hook skipped.",
     )
-
-def start_frida_total_kills():
-    global killCounterAddress, _KILL_COUNTER_FRIDA_SESSION, _KILL_COUNTER_FRIDA_SCRIPT
-    global KILL_COUNTER_MONITOR_ADDR, KILL_COUNTER_MONITOR_PTR, KILL_COUNTER_LAST_VALUE
-
-    if killCounterAddress is None:
-        _log_info("[KILLS] No resolved kill counter RVA; hook skipped.")
-        return
-    if not isinstance(killCounterAddress, int):
-        _log_warn("[KILLS] Invalid kill counter RVA type:", type(killCounterAddress))
-        return
-
-    KILL_COUNTER_MONITOR_ADDR = None
-    KILL_COUNTER_MONITOR_PTR = None
-    KILL_COUNTER_LAST_VALUE = None
-    session = frida_attach_target()
-    script_code = f"""
-    var mod = Process.getModuleByName("Endless.exe");
-    var base = mod.base;
-    var target = base.add(ptr("{hex(killCounterAddress)}"));
-
-    Interceptor.attach(target, {{
-        onEnter: function(args) {{
-            try {{
-                var ebx = this.context.ebx || this.context.rbx;
-                if (!ebx) return;
-
-                this.counterAddr = ptr(ebx).add(0x10);
-                send({{
-                    kills_addr: this.counterAddr.toString()
-                }});
-            }} catch (_) {{
-                // keep hook resilient in hot path
-            }}
-        }}
-    }});
-    """
-    _KILL_COUNTER_FRIDA_SESSION = session
-    _KILL_COUNTER_FRIDA_SCRIPT = _load_frida_script(
-        session, script_code, on_message_total_kills, label="kills-total-hook"
-    )
-    _log_info("[KILLS] Lock hook installed")
 
 def on_message_directional(message, data):
     global directional_address
@@ -3718,9 +3674,6 @@ def start_frida_other_players():
         _log_warn(f"[frida][other_players] Failed to start: {e}")
 CURRENT_HP = None  # Updated by Frida hook
 CURRENT_MANA = None  # Updated by Frida hook
-KILL_COUNTER_MONITOR_ADDR = None
-KILL_COUNTER_MONITOR_PTR = None
-KILL_COUNTER_LAST_VALUE = None
 
 def read_current_hp():
     """Return current HP from Frida hook."""
@@ -3731,16 +3684,6 @@ def read_current_mana():
     """Return current mana from Frida hook."""
     global CURRENT_MANA
     return CURRENT_MANA
-
-def read_session_kills() -> int:
-    global KILL_COUNTER_MONITOR_PTR, pm
-    addr_ptr = KILL_COUNTER_MONITOR_PTR
-    if addr_ptr is None or pm is None:
-        return 0
-    try:
-        return int(pm.read_int(int(addr_ptr)))
-    except Exception:
-        return 0
 
 class PlayerDataManager:
     def __init__(self):
@@ -5509,9 +5452,8 @@ class PlayerDataPopup:
 
         stats = [
             "exp","level","tnl","weight","vit","dex","acc","def","pwr","crit",
-            "armor","eva","hit_rate","max_dmg","min_dmg","aura","max_hp","max_mana","eon","session_kills"
+            "armor","eva","hit_rate","max_dmg","min_dmg","aura","max_hp","max_mana","eon"
         ]
-        stat_labels = {"session_kills": "SESSION KILLS"}
 
         STAT_COLS = 2  # change to 3 to make it even shorter
         rows_per_col = (len(stats) + STAT_COLS - 1) // STAT_COLS  # ceil
@@ -5521,8 +5463,7 @@ class PlayerDataPopup:
             r = idx % rows_per_col
             c = (idx // rows_per_col) * 2  # each stat uses 2 grid columns (label, value)
 
-            label_text = stat_labels.get(stat, stat.upper())
-            ttk.Label(stats_frame, text=f"{label_text}:").grid(
+            ttk.Label(stats_frame, text=f"{stat.upper()}:").grid(
                 row=r, column=c, sticky="w", padx=(0,6), pady=(2,1)
             )
             lbl = ttk.Label(stats_frame, text="N/A", anchor="w")
@@ -8853,9 +8794,25 @@ def combat_thread():
 
         _end_attack_wait(0.02)
 
+def _ensure_supported_frida_version() -> None:
+    version = str(getattr(frida, "__version__", "") or "").strip()
+    if not version:
+        return
+    major = version.split(".", 1)[0]
+    if major != "16":
+        raise RuntimeError(
+            f"Unsupported Frida version detected ({version}). Use frida==16.1.4."
+        )
+
 def main_full_bot():
     global BOT_GUI
     _set_bot_running(False)
+
+    try:
+        _ensure_supported_frida_version()
+    except Exception as e:
+        _log_error(f"[ERROR] {e}")
+        return
 
     load_settings()
 
@@ -8893,7 +8850,6 @@ def main_full_bot():
             (check_player_data, (x_address, y_address)),
             (start_frida_current_hp, ()),
             (start_frida_current_mana, ()),
-            (start_frida_total_kills, ()),
             (combat_thread, ()),
             (_click_buff_thread, ()),
             (_hp_buff_thread, ()),

@@ -1604,49 +1604,51 @@ def go_to_target(
     ignore_player_blockers: bool = False,
     push_through_blockers: bool = False,
 ) -> bool:
-    """Universal live-XY navigator shared by home/combat movement targets."""
-    import time
-    base_walkable = get_walkable_tiles_cached()
-    no_timeout = (timeout_s is None) or (float(timeout_s) <= 0.0)
-    timeout_value = 0.0 if no_timeout else float(timeout_s)
-    quiet_nav = str(tag).upper() == "HOME"
 
-    def _nav_log(msg: str):
-        if not quiet_nav:
-            _log_debug(msg)
+    import time
+
+    base_walkable = get_walkable_tiles_cached()
 
     if excluded_tiles:
         base_walkable -= set(excluded_tiles)
 
-    _nav_log(
-        f"[NAV] go_to_target timeout_s={'OFF' if no_timeout else timeout_value} (near_thresh={near_thresh}, tag={tag}, "
-        f"excluded={len(excluded_tiles) if excluded_tiles else 0}, exact_goal={exact_goal}, "
-        f"ignore_player_blockers={ignore_player_blockers}, push_through={push_through_blockers})"
-    )
+    no_timeout = (timeout_s is None) or (float(timeout_s) <= 0.0)
+    timeout_value = 0.0 if no_timeout else float(timeout_s)
+
+    quiet_nav = str(tag).upper() == "HOME"
+
+    def _nav_log(msg):
+        if not quiet_nav:
+            _log_debug(msg)
 
     cur = _live_xy()
     if cur is None:
-        _nav_log(f"[{tag}] invalid start XY {cur}; abort")
+        _nav_log(f"[{tag}] invalid start XY {cur}")
         return False
-    if cur not in base_walkable:
-        if push_through_blockers:
-            base_walkable.add(cur)
-        else:
-            _nav_log(f"[{tag}] invalid start XY {cur}; abort")
-            return False
 
     goal = target.get_xy()
     if goal is None:
         _nav_log(f"[{tag}] target has no position")
         return False
+
+    is_home_nav = str(tag).upper() == "HOME" and goal == HOME_POS
+
+    # strict start validation (v17 behavior)
+    if cur not in base_walkable:
+        if push_through_blockers and is_home_nav:
+            base_walkable.add(cur)
+        else:
+            _nav_log(f"[{tag}] invalid start XY {cur}")
+            return False
+
     if goal not in base_walkable:
-        if push_through_blockers:
+        if push_through_blockers and is_home_nav:
             base_walkable.add(goal)
         else:
             _nav_log(f"[{tag}] goal {goal} not walkable")
             return False
 
-    def _arrived(xy: Optional[Tuple[int, int]], dest: Tuple[int, int]) -> bool:
+    def _arrived(xy, dest):
         if xy is None:
             return False
         if exact_goal:
@@ -1657,65 +1659,38 @@ def go_to_target(
         return bool(target.on_arrival())
 
     t0 = time.time()
-    blocked_tile_failures: Dict[Tuple[int, int], int] = {}
+
+    blocked_tile_failures = {}
     BLOCKED_TILE_THRESHOLD = 3
 
     while True:
+
         if (not no_timeout) and ((time.time() - t0) >= timeout_value):
             break
+
         if not target.is_valid():
-            _nav_log(f"[{tag}] target invalid/despawned")
             return False
 
         g = target.get_xy()
         if g is None:
-            _nav_log(f"[{tag}] target lost")
             return False
+
         goal = g
 
-        if (not ignore_player_blockers) and goal in _other_player_tiles_near(goal[0], goal[1], radius=1):
-            _nav_log(f"[{tag}] goal tile {goal} now occupied by player; aborting to try alternate stand")
-            return False
-
         cur = _live_xy()
+
         if _arrived(cur, goal):
-            if target.on_arrival():
-                return True
-
-        if cur is not None and cur not in base_walkable:
-            _nav_log(f"[{tag}] player at {cur} is on unwalkable tile; trying to recover to nearby walkable tile...")
-            neighbors = [(cur[0], cur[1]-1), (cur[0]+1, cur[1]), (cur[0], cur[1]+1), (cur[0]-1, cur[1])]
-            for neighbor in neighbors:
-                if neighbor in base_walkable:
-                    _nav_log(f"[{tag}] recovering to walkable neighbor {neighbor}")
-                    key = _direction_key(cur, neighbor)
-                    if not key:
-                        continue
-                    hold_key(key)
-                    recovery_deadline = time.monotonic() + 1.0
-                    recovered = False
-                    try:
-                        while time.monotonic() < recovery_deadline:
-                            xy = _live_xy()
-                            if xy and xy != cur and xy in base_walkable:
-                                cur = xy
-                                recovered = True
-                                _nav_log(f"[{tag}] recovered to {cur}")
-                                break
-                            time.sleep(STEP_POLL_S)
-                    finally:
-                        release_key(key)
-
-                    if recovered:
-                        break
+            return bool(target.on_arrival())
 
         if cur is None:
             continue
 
         allowed_walkable = base_walkable.copy()
+
         if cur not in allowed_walkable:
             allowed_walkable.add(cur)
 
+        # remove player tiles when avoidance enabled
         if not ignore_player_blockers:
             for tile in _other_player_tiles_near(cur[0], cur[1], radius=9):
                 allowed_walkable.discard(tile)
@@ -1725,86 +1700,115 @@ def go_to_target(
                 allowed_walkable.discard(tile)
 
         path = _path_or_none(cur, goal, allowed_walkable)
+
+        # ---------- NO PATH ----------
         if path is None:
-            if push_through_blockers:
-                dx = int(goal[0]) - int(cur[0])
-                dy = int(goal[1]) - int(cur[1])
-                if dx == 0 and dy == 0:
-                    if target.on_arrival():
-                        return True
-                    return False
+
+            # try again ignoring players (still respecting walls)
+            if AVOID_OTHER_PLAYERS and not ignore_player_blockers:
+                path = _path_or_none(cur, goal, base_walkable)
+                if path:
+                    continue
+
+            # emergency push only if trapped by players while going home
+            near_players = _other_player_tiles_near(cur[0], cur[1], radius=2)
+            adjacent_tiles = [
+                (cur[0] + 1, cur[1]),
+                (cur[0] - 1, cur[1]),
+                (cur[0], cur[1] + 1),
+                (cur[0], cur[1] - 1),
+            ]
+            player_blocking_adjacent = any(t in near_players for t in adjacent_tiles)
+            if (
+                push_through_blockers
+                and is_home_nav
+                and AVOID_OTHER_PLAYERS
+                and player_blocking_adjacent
+            ):
+
+                dx = goal[0] - cur[0]
+                dy = goal[1] - cur[1]
 
                 if abs(dx) >= abs(dy):
                     nxt = (cur[0] + (1 if dx > 0 else -1 if dx < 0 else 0), cur[1])
-                    if dx == 0:
-                        nxt = (cur[0], cur[1] + (1 if dy > 0 else -1))
                 else:
                     nxt = (cur[0], cur[1] + (1 if dy > 0 else -1 if dy < 0 else 0))
-                    if dy == 0:
-                        nxt = (cur[0] + (1 if dx > 0 else -1), cur[1])
 
                 key = _direction_key(cur, nxt)
+
                 if key:
                     hold_key(key)
-                    push_deadline = time.monotonic() + STEP_TIMEOUT_S + 0.90
+
+                    deadline = time.monotonic() + STEP_TIMEOUT_S + 0.9
+
                     try:
-                        while time.monotonic() < push_deadline:
+                        while time.monotonic() < deadline:
+
                             xy = _live_xy()
+
                             if _arrived(xy, goal):
                                 release_key(key)
                                 return bool(target.on_arrival())
+
                             if xy and xy != cur:
                                 cur = xy
                                 break
+
                             time.sleep(STEP_POLL_S)
+
                     finally:
                         try:
                             release_key(key)
-                        except Exception:
+                        except:
                             pass
+
                 time.sleep(0.01)
                 continue
 
             _nav_log(f"[{tag}] no path {cur}->{goal}")
             return False
 
-        if not ignore_player_blockers:
-            blocked_path_tiles = list(set(path[1:]).intersection(_other_player_tiles_near(cur[0], cur[1], radius=9)))
-            if blocked_path_tiles:
-                _nav_log(f"[{tag}] path blocked by players at {blocked_path_tiles}; rerouting...")
-                time.sleep(0.01)
-                continue
+        # ---------- PATH FOUND ----------
 
         try:
             global current_path_tiles, path_fade_timestamp
-            current_path_tiles = path[1:]
-            path_fade_timestamp = None  # Reset - path is now actively being traversed, not yet at destination
-        except Exception:
+            current_path_tiles = path[1:] if path else []
+            path_fade_timestamp = None
+        except:
             pass
 
         progressed = False
+
         i = 1
+
         while i < len(path):
+
             nxt = path[i]
+
             if nxt not in allowed_walkable:
-                _nav_log(f"[{tag}] path step {nxt} not walkable")
                 break
 
             key = _direction_key(cur, nxt)
+
             if not key:
                 break
 
             hold_key(key)
-            deadline = time.monotonic() + STEP_TIMEOUT_S + 0.20
+
+            deadline = time.monotonic() + STEP_TIMEOUT_S + 0.2
             reached_next = False
-            xy = cur
+
             try:
+
                 while time.monotonic() < deadline:
+
                     xy = _live_xy()
+
                     if xy and xy == nxt:
                         cur = xy
                         reached_next = True
                         break
+
                     elif xy and xy != cur:
                         cur = xy
 
@@ -1817,66 +1821,36 @@ def go_to_target(
                         break
 
                     time.sleep(STEP_POLL_S)
+
             finally:
                 release_key(key)
 
             if reached_next:
+
                 progressed = True
                 blocked_tile_failures.pop(nxt, None)
                 i += 1
+
                 if _arrived(cur, goal):
-                    if target.on_arrival():
-                        return True
-                    else:
-                        return False
+                    return bool(target.on_arrival())
+
                 continue
 
-            if push_through_blockers:
-                hold_key(key)
-                push_deadline = time.monotonic() + STEP_TIMEOUT_S + 0.90
-                moved_during_push = False
-                try:
-                    while time.monotonic() < push_deadline:
-                        xy = _live_xy()
-                        if _arrived(xy, goal):
-                            release_key(key)
-                            return bool(target.on_arrival())
-                        if xy and xy != cur:
-                            cur = xy
-                            moved_during_push = True
-                            break
-                        time.sleep(STEP_POLL_S)
-                finally:
-                    try:
-                        release_key(key)
-                    except Exception:
-                        pass
-
-                if moved_during_push:
-                    progressed = True
-                    break
-
             blocked_tile_failures[nxt] = blocked_tile_failures.get(nxt, 0) + 1
-
-            if cur not in base_walkable:
-                _nav_log(f"[{tag}] player drifted to unwalkable tile {cur}; breaking for recovery in outer loop")
-                progressed = False
-                break
-
-            _nav_log(f"[{tag}] player drifted to {cur} (not on planned path); rerouting...")
             progressed = False
             break
 
         if not progressed:
+
             cur = _live_xy()
+
             if _arrived(cur, goal):
-                if target.on_arrival():
-                    return True
-                else:
-                    return False
+                return bool(target.on_arrival())
+
             time.sleep(0.01)
 
     _nav_log(f"[{tag}] timeout navigating to {goal}")
+
     return False
 
 def start_bot():

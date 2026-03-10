@@ -1810,7 +1810,10 @@ def go_to_target(
                         break
 
                     elif xy and xy != cur:
-                        cur = xy
+                        if xy in base_walkable:
+                            cur = xy
+                        else:
+                            _nav_log(f"[NAV] ignoring drift to non-walkable tile {xy}")
 
                     if xy and _distance_tiles(xy, nxt) <= 0.5:
                         cur = xy

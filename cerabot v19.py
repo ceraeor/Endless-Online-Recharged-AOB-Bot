@@ -17,7 +17,6 @@ import os, sys
 from collections import deque
 import re
 import copy
-import shutil
 import ctypes
 from ctypes import wintypes
 from tkinter import messagebox, simpledialog
@@ -35,62 +34,6 @@ def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
-
-def _resource_base_dir() -> Path:
-    """Return the bundled resource folder (PyInstaller temp dir when onefile)."""
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            return Path(str(meipass)).resolve()
-    return _app_base_dir()
-
-def _copy_missing_files(src_dir: Path, dst_dir: Path):
-    """Copy bundled defaults into writable runtime dirs without overwriting user files."""
-    try:
-        if not src_dir.is_dir():
-            return
-    except Exception:
-        return
-
-    try:
-        if src_dir.resolve() == dst_dir.resolve():
-            return
-    except Exception:
-        pass
-
-    for src_file in src_dir.rglob("*"):
-        try:
-            if not src_file.is_file():
-                continue
-            rel = src_file.relative_to(src_dir)
-            dst_file = dst_dir / rel
-            if dst_file.exists():
-                continue
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dst_file)
-        except Exception:
-            pass
-
-def _seed_runtime_data_dirs(app_base_dir: Path, resource_base_dir: Path, config_dir: Path, walkable_maps_dir: Path):
-    """
-    For frozen builds, pre-populate writable runtime folders from bundled assets.
-    Keeps user-edited files persistent beside the EXE.
-    """
-    if not getattr(sys, "frozen", False):
-        return
-
-    try:
-        config_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    try:
-        walkable_maps_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-    for cfg_name in ("config", "Config"):
-        _copy_missing_files(resource_base_dir / cfg_name, config_dir)
-    _copy_missing_files(resource_base_dir / "walkable_maps", walkable_maps_dir)
 BOT_GUI = None  # Global reference to the GUI instance
 pydirectinput.FAILSAFE = False  # Disable fail-safe to allow corner screen interactions
 pyautogui.PAUSE = 0
@@ -110,6 +53,8 @@ HP_AOB = "89 B4 8B F0 01 00 00"
 MANA_AOB = "89 B4 8B 88 03 00 00"
 OTHER_PLAYERS_AOB = "66 89 91 50 01 00 00"
 MAP_ID_AOB = "89 4B 14 8B 85 1C FF FF FF 89 43 1C"
+# Session kill counter path: ... call <fn>; inc dword ptr [ebx+10]
+KILL_COUNTER_AOB = "8B D7 E8 ?? ?? ?? ?? FF 43 10 8B C3 8B 10 FF 52 70"
 
 NPC_ADD1_AOB = "66 01 81 A0 00 00 00"
 NPC_ADD2_AOB = "66 01 82 A2 00 00 00"
@@ -159,6 +104,7 @@ x_address = None
 y_address = None
 directional_address = None
 mapIdAddress = None
+killCounterAddress = None
 current_target_npc = None
 pm = None  # Global pymem instance
 stat_base = None  
@@ -200,13 +146,11 @@ _target_immunity_until = {}  # addr_hex -> monotonic deadline
 BOSS_AGGRO_TOGGLE = True  # <<< Toggle for boss aggro detection during sitting
 SIT_TIMER_SECONDS = 70   # <<< Configurable sit timer in seconds
 APP_BASE_DIR = _app_base_dir()
-RESOURCE_BASE_DIR = _resource_base_dir()
 WALKABLE_MAPS_DIR = APP_BASE_DIR / "walkable_maps"
 CONFIG_DIR = APP_BASE_DIR / "config"
 DEFAULT_CONFIG_FILE_NAME = "cerabot_config.json"
 LEGACY_CONFIG_FILE_NAME = "cerafrog_config.json"
 CONFIG_FILE = str((CONFIG_DIR / DEFAULT_CONFIG_FILE_NAME).resolve())  # Active config file path
-_seed_runtime_data_dirs(APP_BASE_DIR, RESOURCE_BASE_DIR, CONFIG_DIR, WALKABLE_MAPS_DIR)
 KILL_QUARANTINE_SEC = 1.0        # keep a killed NPC muted for ~8s (prevents re-targeting during home routine)
 RECENTLY_KILLED: Dict[str, float] = {}  # addr_hex -> time.monotonic()
 _last_kill_ts: Dict[str, float] = {}
@@ -229,6 +173,8 @@ _MANA_FRIDA_SESSION = None
 _MANA_FRIDA_SCRIPT  = None  # Keep Python-side reference so hook script is not GC'd.
 _MAP_ID_FRIDA_SESSION = None
 _MAP_ID_FRIDA_SCRIPT = None
+_KILL_COUNTER_FRIDA_SESSION = None
+_KILL_COUNTER_FRIDA_SCRIPT = None
 NO_CLICK_UNTIL = 0.0
 CLICK_BUFFS_ENABLED    = False       # GUI toggle
 CLICK_BUFF_INTERVAL_S  = 20.0        # seconds between F6 self-buff clicks
@@ -703,13 +649,10 @@ class _EmbeddedFridaInput:
 
     def _script_path(self) -> Optional[Path]:
         base = _app_base_dir()
-        resource_base = _resource_base_dir()
         candidates = [
             base / "input_spoofer.js",
-            resource_base / "input_spoofer.js",
             Path.cwd() / "input_spoofer.js",
             base / "bot-v18.6-eco" / "input_spoofer.js",
-            resource_base / "bot-v18.6-eco" / "input_spoofer.js",
             Path.cwd() / "bot-v18.6-eco" / "input_spoofer.js",
         ]
         for p in candidates:
@@ -1547,6 +1490,45 @@ def _direction_key(from_xy: Tuple[int, int], to_xy: Tuple[int, int]) -> Optional
         return "up"
     return None
 
+def _recover_to_walkable_neighbor(
+    cur: Optional[Tuple[int, int]],
+    walkable: Set[Tuple[int, int]],
+    *,
+    timeout_s: float = 1.0,
+    tag: str = "NAV",
+) -> Optional[Tuple[int, int]]:
+    """Try to step from a drifted tile back onto a nearby walkable tile."""
+    if cur is None:
+        return None
+
+    neighbors = [
+        (cur[0], cur[1] - 1),
+        (cur[0] + 1, cur[1]),
+        (cur[0], cur[1] + 1),
+        (cur[0] - 1, cur[1]),
+    ]
+
+    for neighbor in neighbors:
+        if neighbor not in walkable:
+            continue
+        key = _direction_key(cur, neighbor)
+        if not key:
+            continue
+
+        hold_key(key)
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        try:
+            while time.monotonic() < deadline:
+                xy = _live_xy()
+                if xy and xy != cur and xy in walkable:
+                    _log_debug(f"[{tag}] recovered to walkable tile {xy}")
+                    return xy
+                time.sleep(STEP_POLL_S)
+        finally:
+            release_key(key)
+
+    return None
+
 def _desired_facing(ply_x: int, ply_y: int, tgt_x: int, tgt_y: int) -> Optional[int]:
     """Return desired facing index (0=down,1=left,2=up,3=right) toward target tile."""
     if tgt_x > ply_x:
@@ -1604,51 +1586,52 @@ def go_to_target(
     ignore_player_blockers: bool = False,
     push_through_blockers: bool = False,
 ) -> bool:
-
+    """Universal live-XY navigator shared by home/combat movement targets."""
     import time
-
     base_walkable = get_walkable_tiles_cached()
+    no_timeout = (timeout_s is None) or (float(timeout_s) <= 0.0)
+    timeout_value = 0.0 if no_timeout else float(timeout_s)
+    quiet_nav = str(tag).upper() == "HOME"
+
+    def _nav_log(msg: str):
+        if not quiet_nav:
+            _log_debug(msg)
 
     if excluded_tiles:
         base_walkable -= set(excluded_tiles)
 
-    no_timeout = (timeout_s is None) or (float(timeout_s) <= 0.0)
-    timeout_value = 0.0 if no_timeout else float(timeout_s)
-
-    quiet_nav = str(tag).upper() == "HOME"
-
-    def _nav_log(msg):
-        if not quiet_nav:
-            _log_debug(msg)
+    _nav_log(
+        f"[NAV] go_to_target timeout_s={'OFF' if no_timeout else timeout_value} (near_thresh={near_thresh}, tag={tag}, "
+        f"excluded={len(excluded_tiles) if excluded_tiles else 0}, exact_goal={exact_goal}, "
+        f"ignore_player_blockers={ignore_player_blockers}, push_through={push_through_blockers})"
+    )
 
     cur = _live_xy()
     if cur is None:
-        _nav_log(f"[{tag}] invalid start XY {cur}")
+        _nav_log(f"[{tag}] invalid start XY {cur}; abort")
         return False
+    if cur not in base_walkable:
+        recovered = _recover_to_walkable_neighbor(cur, base_walkable, tag=tag)
+        if recovered is not None:
+            cur = recovered
+        elif push_through_blockers:
+            base_walkable.add(cur)
+        else:
+            _nav_log(f"[{tag}] invalid start XY {cur}; abort")
+            return False
 
     goal = target.get_xy()
     if goal is None:
         _nav_log(f"[{tag}] target has no position")
         return False
-
-    is_home_nav = str(tag).upper() == "HOME" and goal == HOME_POS
-
-    # strict start validation (v17 behavior)
-    if cur not in base_walkable:
-        if push_through_blockers and is_home_nav:
-            base_walkable.add(cur)
-        else:
-            _nav_log(f"[{tag}] invalid start XY {cur}")
-            return False
-
     if goal not in base_walkable:
-        if push_through_blockers and is_home_nav:
+        if push_through_blockers:
             base_walkable.add(goal)
         else:
             _nav_log(f"[{tag}] goal {goal} not walkable")
             return False
 
-    def _arrived(xy, dest):
+    def _arrived(xy: Optional[Tuple[int, int]], dest: Tuple[int, int]) -> bool:
         if xy is None:
             return False
         if exact_goal:
@@ -1659,38 +1642,44 @@ def go_to_target(
         return bool(target.on_arrival())
 
     t0 = time.time()
-
-    blocked_tile_failures = {}
+    blocked_tile_failures: Dict[Tuple[int, int], int] = {}
     BLOCKED_TILE_THRESHOLD = 3
 
     while True:
-
         if (not no_timeout) and ((time.time() - t0) >= timeout_value):
             break
-
         if not target.is_valid():
+            _nav_log(f"[{tag}] target invalid/despawned")
             return False
 
         g = target.get_xy()
         if g is None:
+            _nav_log(f"[{tag}] target lost")
             return False
-
         goal = g
 
-        cur = _live_xy()
+        if (not ignore_player_blockers) and goal in _other_player_tiles_near(goal[0], goal[1], radius=1):
+            _nav_log(f"[{tag}] goal tile {goal} now occupied by player; aborting to try alternate stand")
+            return False
 
+        cur = _live_xy()
         if _arrived(cur, goal):
-            return bool(target.on_arrival())
+            if target.on_arrival():
+                return True
+
+        if cur is not None and cur not in base_walkable:
+            _nav_log(f"[{tag}] player at {cur} is on unwalkable tile; trying to recover to nearby walkable tile...")
+            recovered = _recover_to_walkable_neighbor(cur, base_walkable, tag=tag)
+            if recovered is not None:
+                cur = recovered
 
         if cur is None:
             continue
 
         allowed_walkable = base_walkable.copy()
-
         if cur not in allowed_walkable:
             allowed_walkable.add(cur)
 
-        # remove player tiles when avoidance enabled
         if not ignore_player_blockers:
             for tile in _other_player_tiles_near(cur[0], cur[1], radius=9):
                 allowed_walkable.discard(tile)
@@ -1700,120 +1689,94 @@ def go_to_target(
                 allowed_walkable.discard(tile)
 
         path = _path_or_none(cur, goal, allowed_walkable)
-
-        # ---------- NO PATH ----------
         if path is None:
-
-            # try again ignoring players (still respecting walls)
-            if AVOID_OTHER_PLAYERS and not ignore_player_blockers:
-                path = _path_or_none(cur, goal, base_walkable)
-                if path:
-                    continue
-
-            # emergency push only if trapped by players while going home
-            near_players = _other_player_tiles_near(cur[0], cur[1], radius=2)
-            adjacent_tiles = [
-                (cur[0] + 1, cur[1]),
-                (cur[0] - 1, cur[1]),
-                (cur[0], cur[1] + 1),
-                (cur[0], cur[1] - 1),
-            ]
-            player_blocking_adjacent = any(t in near_players for t in adjacent_tiles)
-            if (
-                push_through_blockers
-                and is_home_nav
-                and AVOID_OTHER_PLAYERS
-                and player_blocking_adjacent
-            ):
-
-                dx = goal[0] - cur[0]
-                dy = goal[1] - cur[1]
+            if push_through_blockers:
+                dx = int(goal[0]) - int(cur[0])
+                dy = int(goal[1]) - int(cur[1])
+                if dx == 0 and dy == 0:
+                    if target.on_arrival():
+                        return True
+                    return False
 
                 if abs(dx) >= abs(dy):
                     nxt = (cur[0] + (1 if dx > 0 else -1 if dx < 0 else 0), cur[1])
+                    if dx == 0:
+                        nxt = (cur[0], cur[1] + (1 if dy > 0 else -1))
                 else:
                     nxt = (cur[0], cur[1] + (1 if dy > 0 else -1 if dy < 0 else 0))
+                    if dy == 0:
+                        nxt = (cur[0] + (1 if dx > 0 else -1), cur[1])
 
                 key = _direction_key(cur, nxt)
-
                 if key:
                     hold_key(key)
-
-                    deadline = time.monotonic() + STEP_TIMEOUT_S + 0.9
-
+                    push_deadline = time.monotonic() + STEP_TIMEOUT_S + 0.90
                     try:
-                        while time.monotonic() < deadline:
-
+                        while time.monotonic() < push_deadline:
                             xy = _live_xy()
-
                             if _arrived(xy, goal):
                                 release_key(key)
                                 return bool(target.on_arrival())
-
                             if xy and xy != cur:
                                 cur = xy
                                 break
-
                             time.sleep(STEP_POLL_S)
-
                     finally:
                         try:
                             release_key(key)
-                        except:
+                        except Exception:
                             pass
-
                 time.sleep(0.01)
                 continue
 
             _nav_log(f"[{tag}] no path {cur}->{goal}")
             return False
 
-        # ---------- PATH FOUND ----------
+        if not ignore_player_blockers:
+            blocked_path_tiles = list(set(path[1:]).intersection(_other_player_tiles_near(cur[0], cur[1], radius=9)))
+            if blocked_path_tiles:
+                _nav_log(f"[{tag}] path blocked by players at {blocked_path_tiles}; rerouting...")
+                time.sleep(0.01)
+                continue
 
         try:
             global current_path_tiles, path_fade_timestamp
-            current_path_tiles = path[1:] if path else []
-            path_fade_timestamp = None
-        except:
+            current_path_tiles = path[1:]
+            path_fade_timestamp = None  # Reset - path is now actively being traversed, not yet at destination
+        except Exception:
             pass
 
         progressed = False
-
         i = 1
-
         while i < len(path):
-
             nxt = path[i]
-
             if nxt not in allowed_walkable:
+                _nav_log(f"[{tag}] path step {nxt} not walkable")
                 break
 
             key = _direction_key(cur, nxt)
-
             if not key:
                 break
 
             hold_key(key)
-
-            deadline = time.monotonic() + STEP_TIMEOUT_S + 0.2
+            deadline = time.monotonic() + STEP_TIMEOUT_S + 0.20
             reached_next = False
-
+            xy = cur
             try:
-
                 while time.monotonic() < deadline:
-
                     xy = _live_xy()
-
                     if xy and xy == nxt:
                         cur = xy
                         reached_next = True
                         break
-
                     elif xy and xy != cur:
-                        if xy in base_walkable:
-                            cur = xy
-                        else:
+                        if xy not in base_walkable:
                             _nav_log(f"[NAV] ignoring drift to non-walkable tile {xy}")
+                            time.sleep(STEP_POLL_S)
+                            continue
+                        cur = xy
+                        reached_next = _distance_tiles(xy, nxt) <= 0.5
+                        break
 
                     if xy and _distance_tiles(xy, nxt) <= 0.5:
                         cur = xy
@@ -1824,36 +1787,66 @@ def go_to_target(
                         break
 
                     time.sleep(STEP_POLL_S)
-
             finally:
                 release_key(key)
 
             if reached_next:
-
                 progressed = True
                 blocked_tile_failures.pop(nxt, None)
                 i += 1
-
                 if _arrived(cur, goal):
-                    return bool(target.on_arrival())
-
+                    if target.on_arrival():
+                        return True
+                    else:
+                        return False
                 continue
 
+            if push_through_blockers:
+                hold_key(key)
+                push_deadline = time.monotonic() + STEP_TIMEOUT_S + 0.90
+                moved_during_push = False
+                try:
+                    while time.monotonic() < push_deadline:
+                        xy = _live_xy()
+                        if _arrived(xy, goal):
+                            release_key(key)
+                            return bool(target.on_arrival())
+                        if xy and xy != cur:
+                            cur = xy
+                            moved_during_push = True
+                            break
+                        time.sleep(STEP_POLL_S)
+                finally:
+                    try:
+                        release_key(key)
+                    except Exception:
+                        pass
+
+                if moved_during_push:
+                    progressed = True
+                    break
+
             blocked_tile_failures[nxt] = blocked_tile_failures.get(nxt, 0) + 1
+
+            if cur not in base_walkable:
+                _nav_log(f"[{tag}] player drifted to unwalkable tile {cur}; breaking for recovery in outer loop")
+                progressed = False
+                break
+
+            _nav_log(f"[{tag}] player drifted to {cur} (not on planned path); rerouting...")
             progressed = False
             break
 
         if not progressed:
-
             cur = _live_xy()
-
             if _arrived(cur, goal):
-                return bool(target.on_arrival())
-
+                if target.on_arrival():
+                    return True
+                else:
+                    return False
             time.sleep(0.01)
 
     _nav_log(f"[{tag}] timeout navigating to {goal}")
-
     return False
 
 def start_bot():
@@ -2037,7 +2030,7 @@ def read_stat(name):
     Special handling for current_hp/current_mana which come from Frida hooks.
     """
     global stat_base, CURRENT_HP, CURRENT_MANA
-    if stat_base is None and name not in ('current_hp', 'current_mana'):
+    if stat_base is None and name not in ('current_hp', 'current_mana', 'session_kills'):
         return None
     
     if name == 'current_hp':
@@ -2051,6 +2044,12 @@ def read_stat(name):
             return CURRENT_MANA  # Atomic read, no lock needed
         except Exception:
             return None
+
+    if name == 'session_kills':
+        try:
+            return read_session_kills()
+        except Exception:
+            return 0
     
     addr = stat_base + STAT_OFFSETS[name]
     try:
@@ -2067,6 +2066,7 @@ def read_all_stats():
         stats[k] = read_stat(k)
     stats['current_hp'] = read_current_hp()
     stats['current_mana'] = read_current_mana()
+    stats['session_kills'] = read_session_kills()
     return stats
 
 def _normalize_direction(raw_dir: Any) -> int:
@@ -2090,7 +2090,7 @@ def tap_key(key_name: str, times: int = 1, gap: float = 0.08):
     import time
     for _ in range(times):
         try:
-            press_key(key_name, presses=1, delay=0.0)
+            press_key(key_name, presses=1, delay=0.03, interval=0.0)
         except Exception as e:
             _warn_throttled(f"tap_key:{key_name}", f"[WARN] tap_key({key_name}) failed: {e}", interval_s=2.0)
         time.sleep(gap)
@@ -2246,6 +2246,28 @@ def _home_routine():
             return cur_hp, True
         
         return cur_hp, False
+
+    def _wait_for_heal_confirm(prev_hp, max_hp, timeout_s: float = 1.0):
+        """Wait briefly for an F5 heal to show up in the live HP reading."""
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        latest_hp = prev_hp
+
+        while time.monotonic() < deadline:
+            try:
+                cur_hp = read_current_hp()
+            except Exception:
+                cur_hp = None
+
+            if cur_hp is not None:
+                latest_hp = cur_hp
+                if max_hp is not None and max_hp > 0 and cur_hp >= max_hp:
+                    return cur_hp, True, True
+                if prev_hp is not None and cur_hp > prev_hp:
+                    return cur_hp, True, False
+
+            time.sleep(0.05)
+
+        return latest_hp, False, False
     
     def _wait_for_clicks(label: str, timeout_s: float = 6.0):
         try:
@@ -2319,8 +2341,21 @@ def _home_routine():
             pass
 
         f5_total = int(F5_TAP_COUNT)
-        f5_gap = 0.08
-        for i in range(f5_total):
+        f5_gap = 0.15
+        f5_confirm_timeout = 0.55
+        f5_successes = 0
+        f5_attempts = 0
+        f5_attempt_limit = max(f5_total * 3, f5_total + 4)
+        try:
+            max_hp_for_f5 = read_stat('max_hp')
+        except Exception:
+            max_hp_for_f5 = None
+        try:
+            last_hp_for_f5 = read_current_hp()
+        except Exception:
+            last_hp_for_f5 = None
+
+        while f5_successes < f5_total and f5_attempts < f5_attempt_limit:
             if _nearby_threat_safe():
                 try:
                     tap_key_async('f8', times=1, gap=0.05)  # async - don't block
@@ -2330,9 +2365,49 @@ def _home_routine():
                 return  # leave _home_routine(); finally block will clean up
 
             try:
-                tap_key('f5', times=1, gap=f5_gap)
+                cur_hp_now = read_current_hp()
+            except Exception:
+                cur_hp_now = None
+
+            if (
+                cur_hp_now is not None
+                and max_hp_for_f5 is not None
+                and max_hp_for_f5 > 0
+                and cur_hp_now >= max_hp_for_f5
+            ):
+                break
+
+            prev_hp = cur_hp_now if cur_hp_now is not None else last_hp_for_f5
+
+            try:
+                tap_key('f5', times=1, gap=0.0)
             except Exception:
                 pass
+
+            f5_attempts += 1
+
+            if prev_hp is None:
+                time.sleep(f5_gap)
+                try:
+                    last_hp_for_f5 = read_current_hp()
+                except Exception:
+                    last_hp_for_f5 = None
+                f5_successes += 1
+                continue
+
+            new_hp, healed, hit_max = _wait_for_heal_confirm(prev_hp, max_hp_for_f5, timeout_s=f5_confirm_timeout)
+            last_hp_for_f5 = new_hp
+
+            if healed:
+                f5_successes += 1
+                if hit_max:
+                    break
+                time.sleep(0.05)
+            else:
+                time.sleep(f5_gap)
+
+        if f5_successes < f5_total:
+            _log_warn(f"[HOME] F5 heal confirmations: {f5_successes}/{f5_total} after {f5_attempts} attempts")
 
         if not hp_home_strict:
             try:
@@ -2456,9 +2531,6 @@ def on_message_exp(message, data):
             try:
                 stat_base = int(base_str, 16)
                 start_weight_lock()
-                if current_target_npc:
-                    _fire_kill_once(current_target_npc, reason="EXP-HOOK")
-                    
             except Exception as e:
                 _log_warn(f"[frida] Failed to parse stat base: {e}")
 
@@ -2488,6 +2560,51 @@ def on_message_mana(message, data):
     value = _on_message_scalar(message, payload_key='mana', err_tag='mana')
     if value is not None:
         CURRENT_MANA = value
+
+def on_message_total_kills(message, data):
+    """Lock one dynamic counter address from the hook, then monitor it directly."""
+    global KILL_COUNTER_MONITOR_ADDR, KILL_COUNTER_MONITOR_PTR, KILL_COUNTER_LAST_VALUE
+    if message.get('type') == 'send':
+        payload = message.get('payload', {})
+        addr = payload.get('kills_addr')
+        if not addr:
+            return
+
+        addr_str = str(addr)
+        try:
+            cand_ptr = int(addr_str, 16)
+        except Exception:
+            return
+        if cand_ptr <= 0x10000:
+            return
+
+        if KILL_COUNTER_MONITOR_PTR is None:
+            KILL_COUNTER_MONITOR_ADDR = addr_str
+            KILL_COUNTER_MONITOR_PTR = int(cand_ptr)
+            _log_info(f"[KILLS] Monitoring dynamic counter @ {KILL_COUNTER_MONITOR_ADDR}")
+            try:
+                if pm is not None:
+                    KILL_COUNTER_LAST_VALUE = int(pm.read_int(int(KILL_COUNTER_MONITOR_PTR)))
+            except Exception:
+                KILL_COUNTER_LAST_VALUE = None
+    elif message.get('type') == 'error':
+        return
+
+    if KILL_COUNTER_MONITOR_PTR is None or pm is None:
+        return
+    try:
+        cur_val = int(pm.read_int(int(KILL_COUNTER_MONITOR_PTR)))
+    except Exception:
+        return
+    if cur_val < 0:
+        return
+
+    prev_val = KILL_COUNTER_LAST_VALUE
+    KILL_COUNTER_LAST_VALUE = cur_val
+    if prev_val is None:
+        return
+    if cur_val > int(prev_val) and current_target_npc:
+        _fire_kill_once(current_target_npc, reason="KILLS-COUNTER")
 
 def _on_kill(addr_hex: str, reason: str):
     global current_target_npc, KILLS_SINCE_HOME, vanish_timer  # must be declared at the very top
@@ -2689,7 +2806,7 @@ def initialize_pymem():
 def resolve_all_aobs(timeout=5.0):
     """
     Universal Frida-based AOB resolver.
-    Resolves WALK, NPC, SPEECH, DIRECTIONAL, EXP, HP, MANA, OTHER_PLAYERS, MAP_ID.
+    Resolves WALK, NPC, SPEECH, DIRECTIONAL, EXP, HP, MANA, OTHER_PLAYERS, MAP_ID, KILL_COUNTER.
     Stores all as integer RVA offsets.
     """
 
@@ -2697,7 +2814,7 @@ def resolve_all_aobs(timeout=5.0):
 
     global walkAddress, npcAddress, speechAddress
     global directionalAddress, expAddress, hpAddress, manaAddress
-    global otherPlayersAddress, mapIdAddress
+    global otherPlayersAddress, mapIdAddress, killCounterAddress
 
     walkAddress = None
     npcAddress = None
@@ -2708,6 +2825,7 @@ def resolve_all_aobs(timeout=5.0):
     manaAddress = None
     otherPlayersAddress = None
     mapIdAddress = None
+    killCounterAddress = None
 
     session = frida_attach_target()
 
@@ -2751,6 +2869,7 @@ def resolve_all_aobs(timeout=5.0):
         const manaHit         = await scan("{MANA_AOB}", false);
         const otherPlayersHit = await scan("{OTHER_PLAYERS_AOB}", false);
         const mapIdHit        = await scan("{MAP_ID_AOB}", true);
+        const killCounterHit  = await scan("{KILL_COUNTER_AOB}", true);
 
         send({{
             type: "aob_results",
@@ -2763,7 +2882,8 @@ def resolve_all_aobs(timeout=5.0):
             hp: hpHit ? hpHit.toString() : null,
             mana: manaHit ? manaHit.toString() : null,
             other_players: otherPlayersHit ? otherPlayersHit.toString() : null,
-            map_id: mapIdHit ? mapIdHit.toString() : null
+            map_id: mapIdHit ? mapIdHit.toString() : null,
+            kill_counter: killCounterHit ? killCounterHit.toString() : null
         }});
     }}
 
@@ -2775,7 +2895,7 @@ def resolve_all_aobs(timeout=5.0):
     def on_aob_message(message, data):
         global walkAddress, npcAddress, speechAddress
         global directionalAddress, expAddress, hpAddress, manaAddress
-        global otherPlayersAddress, mapIdAddress
+        global otherPlayersAddress, mapIdAddress, killCounterAddress
 
         if message["type"] != "send":
             return
@@ -2811,6 +2931,9 @@ def resolve_all_aobs(timeout=5.0):
             otherPlayersAddress = int(payload["other_players"], 16) - base
         if payload.get("map_id"):
             mapIdAddress = int(payload["map_id"], 16) - base
+        if payload.get("kill_counter"):
+            # Signature starts 7 bytes before "inc dword ptr [ebx+0x10]"; hook exact inc instruction.
+            killCounterAddress = (int(payload["kill_counter"], 16) + 7) - base
 
         resolved["done"] = True
 
@@ -2850,6 +2973,10 @@ def resolve_all_aobs(timeout=5.0):
         _log_info("[AOB] MAP_ID        ->", hex(mapIdAddress))
     else:
         _log_warn("[AOB] MAP_ID signature not found; auto map-id loading unavailable.")
+    if isinstance(killCounterAddress, int):
+        _log_info("[AOB] KILL_COUNTER  ->", hex(killCounterAddress))
+    else:
+        _log_warn("[AOB] KILL_COUNTER signature not found; today's kill counter unavailable.")
 
     return True
 
@@ -3057,6 +3184,48 @@ def start_frida_current_mana():
         label="mana-hook",
         none_message="[MANA] No resolved RVA; hook skipped.",
     )
+
+def start_frida_total_kills():
+    global killCounterAddress, _KILL_COUNTER_FRIDA_SESSION, _KILL_COUNTER_FRIDA_SCRIPT
+    global KILL_COUNTER_MONITOR_ADDR, KILL_COUNTER_MONITOR_PTR, KILL_COUNTER_LAST_VALUE
+
+    if killCounterAddress is None:
+        _log_info("[KILLS] No resolved kill counter RVA; hook skipped.")
+        return
+    if not isinstance(killCounterAddress, int):
+        _log_warn("[KILLS] Invalid kill counter RVA type:", type(killCounterAddress))
+        return
+
+    KILL_COUNTER_MONITOR_ADDR = None
+    KILL_COUNTER_MONITOR_PTR = None
+    KILL_COUNTER_LAST_VALUE = None
+    session = frida_attach_target()
+    script_code = f"""
+    var mod = Process.getModuleByName("Endless.exe");
+    var base = mod.base;
+    var target = base.add(ptr("{hex(killCounterAddress)}"));
+
+    Interceptor.attach(target, {{
+        onEnter: function(args) {{
+            try {{
+                var ebx = this.context.ebx || this.context.rbx;
+                if (!ebx) return;
+
+                this.counterAddr = ptr(ebx).add(0x10);
+                send({{
+                    kills_addr: this.counterAddr.toString()
+                }});
+            }} catch (_) {{
+                // keep hook resilient in hot path
+            }}
+        }}
+    }});
+    """
+    _KILL_COUNTER_FRIDA_SESSION = session
+    _KILL_COUNTER_FRIDA_SCRIPT = _load_frida_script(
+        session, script_code, on_message_total_kills, label="kills-total-hook"
+    )
+    _log_info("[KILLS] Lock hook installed")
 
 def on_message_directional(message, data):
     global directional_address
@@ -3651,6 +3820,9 @@ def start_frida_other_players():
         _log_warn(f"[frida][other_players] Failed to start: {e}")
 CURRENT_HP = None  # Updated by Frida hook
 CURRENT_MANA = None  # Updated by Frida hook
+KILL_COUNTER_MONITOR_ADDR = None
+KILL_COUNTER_MONITOR_PTR = None
+KILL_COUNTER_LAST_VALUE = None
 
 def read_current_hp():
     """Return current HP from Frida hook."""
@@ -3661,6 +3833,16 @@ def read_current_mana():
     """Return current mana from Frida hook."""
     global CURRENT_MANA
     return CURRENT_MANA
+
+def read_session_kills() -> int:
+    global KILL_COUNTER_MONITOR_PTR, pm
+    addr_ptr = KILL_COUNTER_MONITOR_PTR
+    if addr_ptr is None or pm is None:
+        return 0
+    try:
+        return int(pm.read_int(int(addr_ptr)))
+    except Exception:
+        return 0
 
 class PlayerDataManager:
     def __init__(self):
@@ -5429,8 +5611,9 @@ class PlayerDataPopup:
 
         stats = [
             "exp","level","tnl","weight","vit","dex","acc","def","pwr","crit",
-            "armor","eva","hit_rate","max_dmg","min_dmg","aura","max_hp","max_mana","eon"
+            "armor","eva","hit_rate","max_dmg","min_dmg","aura","max_hp","max_mana","eon","session_kills"
         ]
+        stat_labels = {"session_kills": "SESSION KILLS"}
 
         STAT_COLS = 2  # change to 3 to make it even shorter
         rows_per_col = (len(stats) + STAT_COLS - 1) // STAT_COLS  # ceil
@@ -5440,7 +5623,8 @@ class PlayerDataPopup:
             r = idx % rows_per_col
             c = (idx // rows_per_col) * 2  # each stat uses 2 grid columns (label, value)
 
-            ttk.Label(stats_frame, text=f"{stat.upper()}:").grid(
+            label_text = stat_labels.get(stat, stat.upper())
+            ttk.Label(stats_frame, text=f"{label_text}:").grid(
                 row=r, column=c, sticky="w", padx=(0,6), pady=(2,1)
             )
             lbl = ttk.Label(stats_frame, text="N/A", anchor="w")
@@ -7688,6 +7872,25 @@ def get_walkable_tiles_cached() -> Set[Tuple[int, int]]:
 
     return set(tiles)
 
+def get_active_walkable_tiles() -> Set[Tuple[int, int]]:
+    """
+    Return the walkable tiles currently active for runtime movement.
+    Prefer the GUI cache because it reflects live map auto-load/selection.
+    """
+    try:
+        gui = globals().get("BOT_GUI")
+        if gui is not None:
+            coords = getattr(gui, "_walkable_coords_cache", None)
+            if coords is not None:
+                return set(coords)
+    except Exception:
+        pass
+
+    try:
+        return set(get_walkable_tiles_cached() or set())
+    except Exception:
+        return set()
+
 def _coords_oob(xv: int, yv: int) -> bool:
     """Simple global check: invalid map coordinates."""
     return (
@@ -8039,7 +8242,7 @@ def combat_thread():
     except NameError:
         IMMUNITY_SEC = 5.0
 
-    base_walkable = set(load_walkable_tiles() or [])
+    base_walkable = get_active_walkable_tiles()
     if not base_walkable:
         base_walkable = {
             (x, y)
@@ -8115,7 +8318,7 @@ def combat_thread():
             return False
         
         hold_key(move_dir)
-        deadline = time.monotonic() + 0.15  # Reduced to 150ms per tile - fast detection
+        deadline = time.monotonic() + 0.12  # Shorter hold reduces overshoot with background input
         reached = False
         try:
             start_xy = _live_xy()
@@ -8214,8 +8417,8 @@ def combat_thread():
             _move_one_step_continuous(move_dir, from_xy, step_xy)
 
         if movement_start_time and (now_ts - movement_start_time) > 2.0:
-            live_player = map_data_indexer.get_player() or {"X": from_xy[0], "Y": from_xy[1]}
-            if (live_player.get("X"), live_player.get("Y")) != step_xy:
+            live_player_xy = _live_xy() or (from_xy[0], from_xy[1])
+            if tuple(live_player_xy) != step_xy:
                 blocked_tiles[step_xy] = now_ts + 3.0
             movement_start_time = None
 
@@ -8470,6 +8673,16 @@ def combat_thread():
             time.sleep(0.05)
             continue
 
+        latest_walkable = get_active_walkable_tiles()
+        if latest_walkable:
+            base_walkable = latest_walkable
+        elif not base_walkable:
+            base_walkable = {
+                (x, y)
+                for x in range(1, INVALID_COORD_LIMIT + 1)
+                for y in range(1, INVALID_COORD_LIMIT + 1)
+            }
+
         now = time.time()
 
         blocked_tiles = {tile: t for tile, t in blocked_tiles.items() if t > now}
@@ -8490,11 +8703,23 @@ def combat_thread():
             _end_attack_wait(0.05)
             continue
 
+        player_xy = _live_xy()
+        if player_xy is None:
+            player_xy = (int(player['X']), int(player['Y']))
+        elif player_xy not in base_walkable:
+            recovered_xy = _recover_to_walkable_neighbor(player_xy, base_walkable, tag="COMBAT")
+            if recovered_xy is not None:
+                player_xy = recovered_xy
+            else:
+                _clear_motion_intent(reset_wander=True)
+                _end_attack_wait(0.02)
+                continue
+
         if AVOID_OTHER_PLAYERS:
             other_players = map_data_indexer.get_other_players()
             if other_players:
                 player_tiles = {(int(p['X']), int(p['Y'])) for p in other_players if p.get('X') is not None and p.get('Y') is not None}
-                player_tiles.discard((int(player['X']), int(player['Y'])))
+                player_tiles.discard((int(player_xy[0]), int(player_xy[1])))
                 adjusted_walkable = adjusted_walkable.difference(player_tiles)
 
         all_npcs = map_data_indexer.get_npcs()
@@ -8528,7 +8753,7 @@ def combat_thread():
         if ctrl_pressed and not current_target_npc:
             _end_attack()
 
-        if target_tile and _distance_tiles((player['X'], player['Y']), target_tile) <= 0.5:
+        if target_tile and _distance_tiles(player_xy, target_tile) <= 0.5:
             _clear_motion_intent()
             try:
                 current_path_tiles = []
@@ -8600,7 +8825,7 @@ def combat_thread():
             else:
                 tiles_for_wander = adjusted_walkable
 
-            cur_pos = (player['X'], player['Y'])
+            cur_pos = player_xy
             if last_position and cur_pos == last_position:
                 if not stuck_timer_start:
                     stuck_timer_start = now
@@ -8629,7 +8854,7 @@ def combat_thread():
             npc_positions = {(n['X'], n['Y']) for n in valid_npcs}
             extended_walkable = adjusted_walkable.difference(npc_positions)
 
-            target_obj = _select_target_obj(valid_npcs, int(player['X']), int(player['Y']))
+            target_obj = _select_target_obj(valid_npcs, int(player_xy[0]), int(player_xy[1]))
 
             if not current_target_npc:
                 _end_attack_wait(0.02)
@@ -8640,7 +8865,7 @@ def combat_thread():
                 continue
 
             npc_x, npc_y = target_obj['X'], target_obj['Y']
-            ply_x, ply_y = player['X'], player['Y']
+            ply_x, ply_y = player_xy
 
             if ctrl_pressed:
                 live_dir = _live_direction(0)
@@ -8691,7 +8916,9 @@ def combat_thread():
                             break
 
                     live = _live_direction(live_dir)
-                    ply_x, ply_y = player['X'], player['Y']
+                    latest_ply = _live_xy()
+                    if latest_ply is not None:
+                        ply_x, ply_y = latest_ply
                     npc_x, npc_y = target_obj['X'], target_obj['Y']
 
                     if _adjacent_and_facing(ply_x, ply_y, npc_x, npc_y, live):
@@ -8701,7 +8928,9 @@ def combat_thread():
                         ok = False
                         while time.time() - t0 < 0.16:           # ~100-160ms sanity window
                             d = _live_direction(live)
-                            ply_x, ply_y = player['X'], player['Y']
+                            latest_ply = _live_xy()
+                            if latest_ply is not None:
+                                ply_x, ply_y = latest_ply
                             npc_x, npc_y = target_obj['X'], target_obj['Y']
                             if _adjacent_and_facing(ply_x, ply_y, npc_x, npc_y, d):
                                 ok = True
@@ -8736,9 +8965,9 @@ def combat_thread():
                 continue
 
             if RANGE_MODE.get(current_target_npc) != "retreating" and on_line and 1 <= dist <= ENGAGE_RANGE and los_ok:
-                fresh_player = map_data_indexer.get_player()
-                if fresh_player:
-                    ply_x, ply_y = fresh_player['X'], fresh_player['Y']
+                fresh_player_xy = _live_xy()
+                if fresh_player_xy is not None:
+                    ply_x, ply_y = fresh_player_xy
 
                 target_dir_idx = _desired_facing(ply_x, ply_y, npc_x, npc_y)
 
@@ -8771,25 +9000,9 @@ def combat_thread():
 
         _end_attack_wait(0.02)
 
-def _ensure_supported_frida_version() -> None:
-    version = str(getattr(frida, "__version__", "") or "").strip()
-    if not version:
-        return
-    major = version.split(".", 1)[0]
-    if major != "16":
-        raise RuntimeError(
-            f"Unsupported Frida version detected ({version}). Use frida==16.1.4."
-        )
-
 def main_full_bot():
     global BOT_GUI
     _set_bot_running(False)
-
-    try:
-        _ensure_supported_frida_version()
-    except Exception as e:
-        _log_error(f"[ERROR] {e}")
-        return
 
     load_settings()
 
@@ -8827,6 +9040,7 @@ def main_full_bot():
             (check_player_data, (x_address, y_address)),
             (start_frida_current_hp, ()),
             (start_frida_current_mana, ()),
+            (start_frida_total_kills, ()),
             (combat_thread, ()),
             (_click_buff_thread, ()),
             (_hp_buff_thread, ()),

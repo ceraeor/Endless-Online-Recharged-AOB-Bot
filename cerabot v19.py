@@ -193,6 +193,13 @@ UI_MAP_REFRESH_S = 0.10
 UI_OTHER_PLAYERS_REFRESH_S = 0.20
 UI_STATS_REFRESH_S = 0.50
 UI_CHAT_REFRESH_S = 0.20
+UI_DROP_LOG_REFRESH_S = 0.75
+
+DROP_PICKUP_MATCH_TIMEOUT_S = 12.0
+CHAT_LOG_ENV_VAR = "CERABOT_CHATLOG_PATH"
+CHAT_LOG_FILE_NAMES = ("ChatLog.txt", "chatlog.txt")
+DROP_MESSAGE_RE = re.compile(r"^Dropped\s+(\d+)\s+(.+?)\s+for\s+(.+?)\.?$", re.IGNORECASE)
+PICKUP_MESSAGE_RE = re.compile(r"^You picked up\s+(\d+)\s+(.+?)\.?$", re.IGNORECASE)
 
 _WARN_THROTTLE: Dict[str, float] = {}
 LOG_VERBOSITY = int(os.environ.get("CERABOT_LOG_VERBOSITY", "1"))  # 0=warn/error, 1=info, 2=debug
@@ -207,6 +214,86 @@ WALKABLE_SOURCE_MODE = "file"  # "file" or "default_grid"
 WALKABLE_SOURCE_MESSAGE = ""
 WALKABLE_SOURCE_PATH: Optional[str] = None
 _INITIAL_CONFIG_STATE: Optional["ConfigState"] = None
+
+
+def _normalize_item_key(name: Any) -> str:
+    """Normalize item names so drop/pickup lines can be matched reliably."""
+    if not name:
+        return ""
+    return re.sub(r"\s+", " ", str(name)).strip().casefold()
+
+
+def _get_process_image_path(pid: Optional[int]) -> Optional[Path]:
+    """Resolve the executable path for a running Windows process."""
+    if not pid:
+        return None
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = None
+    try:
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return None
+
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        if not ok:
+            return None
+        raw = buf.value.strip()
+        return Path(raw).resolve() if raw else None
+    except Exception:
+        return None
+    finally:
+        if handle:
+            try:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
+def _candidate_chat_log_paths() -> List[Path]:
+    raw_env_path = os.environ.get(CHAT_LOG_ENV_VAR, "").strip()
+    seen: Set[str] = set()
+    candidates: List[Path] = []
+
+    def _add(path_value: Union[str, Path, None]):
+        if not path_value:
+            return
+        try:
+            path_obj = Path(path_value).expanduser()
+            resolved = str(path_obj.resolve(strict=False))
+        except Exception:
+            return
+        key = resolved.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(Path(resolved))
+
+    if raw_env_path:
+        _add(raw_env_path)
+
+    target_exe = _get_process_image_path(TARGET_PID)
+    target_dirs: List[Path] = []
+    if target_exe is not None:
+        target_dirs.append(target_exe.parent)
+
+    for base in target_dirs + [APP_BASE_DIR, Path.cwd(), APP_BASE_DIR.parent]:
+        for filename in CHAT_LOG_FILE_NAMES:
+            _add(base / filename)
+
+    return candidates
+
+
+def _resolve_chat_log_path() -> Optional[Path]:
+    for candidate in _candidate_chat_log_paths():
+        try:
+            if candidate.is_file():
+                return candidate.resolve()
+        except Exception:
+            continue
+    return None
 
 DIR_TO_SLOT = {
     0: 2,  # 0 = Down  -> points[2]
@@ -1344,6 +1431,44 @@ def _wait_for_global_hotkey_pynput(hotkey=keyboard.Key.f12, timeout_s=15.0) -> b
         except Exception:
             pass
 
+def _show_preboot_client_select_notice(pids: List[int], attempt: int):
+    """Show client-selection instructions without depending on Tk initialization."""
+    message = (
+        "Multiple Endless Online clients detected.\n\n"
+        "After closing this prompt:\n"
+        "1) Click the Endless window you want to attach to\n"
+        "2) Optionally press F12 while that window is focused\n\n"
+        f"Detected Endless PIDs: {pids}\n"
+        f"(Attempt {attempt}/3)"
+    )
+
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, "Select Endless Client", 0x00000040)
+        return
+    except Exception:
+        pass
+
+    _log_info("[BOOT] Multiple clients detected. Focus the desired Endless window, then press F12 if needed.")
+    _log_info(f"[BOOT] Detected Endless PIDs: {pids} (attempt {attempt}/3)")
+
+
+def _prompt_for_pid_console(pids: List[int]) -> Optional[int]:
+    """Fallback PID prompt that works without Tk."""
+    try:
+        pid_str = input(
+            "\nSelect Endless PID.\n"
+            f"Detected Endless PIDs: {pids}\n"
+            "Enter PID: "
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    try:
+        pid_val = int(pid_str) if pid_str else None
+    except ValueError:
+        return None
+    return pid_val if pid_val in pids else None
+
 def select_target_pid_preboot():
     """
     If more than one Endless.exe is running:
@@ -1362,25 +1487,10 @@ def select_target_pid_preboot():
     pids = {m["pid"] for m in matches}
     _log_info(f"[BOOT] Multiple Endless.exe detected: {sorted(pids)}")
 
-    temp_root = None
-    try:
-        temp_root = tk.Tk()
-        temp_root.withdraw()
-    except Exception:
-        temp_root = None
-
     selected = None
 
     for attempt in range(3):
-        messagebox.showinfo(
-            "Select Endless Client",
-            "Multiple Endless Online clients detected.\n\n"
-            "After closing this box:\n"
-            "1) Click the Endless window you want to attach to (bring it to front)\n"
-            "2) (Optional) Press F12\n\n"
-            f"Detected Endless PIDs: {sorted(pids)}\n"
-            f"(Attempt {attempt+1}/3)"
-        )
+        _show_preboot_client_select_notice(sorted(pids), attempt + 1)
 
         focused = _wait_for_foreground_endless_pid(pids, timeout_s=8.0)
         if focused:
@@ -1399,24 +1509,32 @@ def select_target_pid_preboot():
 
         _log_info(f"[BOOT] Foreground PID {pid} is not one of Endless PIDs {sorted(pids)} (attempt {attempt+1}/3)")
     if selected is None:
-        pid_str = simpledialog.askstring(
-            "Select Endless PID",
-            "Click selection failed.\n\nEnter the PID to attach to:\n"
-            f"Detected Endless PIDs: {sorted(pids)}"
-        )
+        pid_val = None
+
         try:
-            pid_val = int(pid_str) if pid_str else None
-        except ValueError:
-            pid_val = None
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            try:
+                pid_str = simpledialog.askstring(
+                    "Select Endless PID",
+                    "Click selection failed.\n\nEnter the PID to attach to:\n"
+                    f"Detected Endless PIDs: {sorted(pids)}",
+                    parent=temp_root,
+                )
+            finally:
+                try:
+                    temp_root.destroy()
+                except Exception:
+                    pass
+            try:
+                pid_val = int(pid_str) if pid_str else None
+            except ValueError:
+                pid_val = None
+        except BaseException:
+            pid_val = _prompt_for_pid_console(sorted(pids))
 
         if pid_val in pids:
             selected = pid_val
-
-    if temp_root is not None:
-        try:
-            temp_root.destroy()
-        except Exception:
-            pass
 
     if selected is None:
         raise RuntimeError(f"Could not select a valid Endless.exe PID. Detected: {sorted(pids)}")
@@ -4268,6 +4386,15 @@ class PlayerDataPopup:
         self._session_exp_started_at = None
         self._session_exp_total = 0
         self._session_exp_last_value = None
+        self._session_drop_active = False
+        self._session_drop_started_at = None
+        self._session_drop_items: Dict[str, Dict[str, Any]] = {}
+        self._session_drop_pending: Dict[str, List[Dict[str, Any]]] = {}
+        self._last_drop_log_update = 0.0
+        self._drop_log_path: Optional[Path] = _resolve_chat_log_path()
+        self._drop_log_offset = 0
+        self._drop_log_partial = ""
+        self._drop_row_ids: Dict[str, str] = {}
         self._stop_in_progress = False
         self._close_in_progress = False
         self._ui_running = True
@@ -5310,6 +5437,40 @@ class PlayerDataPopup:
         self.other_players_tree.configure(yscrollcommand=players_live_sb.set)
         self._other_player_row_ids = {}
 
+        session_drops = add_section("Session Drops")
+        self.session_drop_summary_label = ttk.Label(
+            session_drops,
+            text="Dropped: 0 | Picked: 0 | Missed: 0 | Pending: 0",
+        )
+        self.session_drop_summary_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        drops_wrap = ttk.Frame(session_drops)
+        drops_wrap.grid(row=1, column=0, sticky="nsew")
+        drops_wrap.columnconfigure(0, weight=1)
+        drops_wrap.rowconfigure(0, weight=1)
+
+        self.session_drop_tree = ttk.Treeview(
+            drops_wrap,
+            columns=("item", "dropped", "picked", "missed", "pending"),
+            show="headings",
+            height=6,
+        )
+        self.session_drop_tree.heading("item", text="Item")
+        self.session_drop_tree.heading("dropped", text="Dropped")
+        self.session_drop_tree.heading("picked", text="Picked")
+        self.session_drop_tree.heading("missed", text="Missed")
+        self.session_drop_tree.heading("pending", text="Pending")
+        self.session_drop_tree.column("item", width=150, anchor="w")
+        self.session_drop_tree.column("dropped", width=62, anchor="center")
+        self.session_drop_tree.column("picked", width=58, anchor="center")
+        self.session_drop_tree.column("missed", width=58, anchor="center")
+        self.session_drop_tree.column("pending", width=62, anchor="center")
+        self.session_drop_tree.grid(row=0, column=0, sticky="nsew")
+
+        drops_sb = ttk.Scrollbar(drops_wrap, orient="vertical", command=self.session_drop_tree.yview)
+        drops_sb.grid(row=0, column=1, sticky="ns")
+        self.session_drop_tree.configure(yscrollcommand=drops_sb.set)
+
         player_avoid = add_section("Player Avoidance")
         self.avoid_players_var = tk.BooleanVar(value=AVOID_OTHER_PLAYERS)
         ttk.Checkbutton(
@@ -5577,9 +5738,15 @@ class PlayerDataPopup:
         info_row.grid(row=1, column=0, sticky="nsew", padx=PADX, pady=PADY)
         info_row.columnconfigure(0, weight=0)
         info_row.columnconfigure(1, weight=1)
+        info_row.rowconfigure(0, weight=1)
 
-        player_frame = ttk.LabelFrame(info_row, text="Player Data", padding=6)
-        player_frame.grid(row=0, column=0, sticky="nw", padx=(0, 12))
+        left_info_col = ttk.Frame(info_row)
+        left_info_col.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        left_info_col.columnconfigure(0, weight=1)
+        left_info_col.rowconfigure(1, weight=1)
+
+        player_frame = ttk.LabelFrame(left_info_col, text="Player Data", padding=6)
+        player_frame.grid(row=0, column=0, sticky="ew")
         for i, text in enumerate(["X", "Y", "Direction"]):
             ttk.Label(player_frame, text=f"{text}:").grid(row=i, column=0, sticky="w")
             v = ttk.Label(player_frame, text="0")
@@ -6485,6 +6652,220 @@ class PlayerDataPopup:
         except Exception:
             pass
 
+    def _ensure_session_drop_item(self, item_name: str) -> Tuple[str, Dict[str, Any]]:
+        item_clean = re.sub(r"\s+", " ", str(item_name or "")).strip()
+        item_key = _normalize_item_key(item_clean)
+        state = self._session_drop_items.get(item_key)
+        if state is None:
+            state = {
+                "name": item_clean or "(unknown)",
+                "dropped": 0,
+                "picked": 0,
+                "missed": 0,
+            }
+            self._session_drop_items[item_key] = state
+        elif item_clean and (not state.get("name") or state["name"] == "(unknown)"):
+            state["name"] = item_clean
+        return item_key, state
+
+    def _pending_drop_count(self, item_key: str) -> int:
+        return sum(int(entry.get("qty", 0)) for entry in self._session_drop_pending.get(item_key, []))
+
+    def _refresh_session_drops_panel(self):
+        if not hasattr(self, "session_drop_summary_label"):
+            return
+
+        total_dropped = 0
+        total_picked = 0
+        total_missed = 0
+        total_pending = 0
+        rows: List[Tuple[str, str, int, int, int, int]] = []
+
+        for item_key, state in self._session_drop_items.items():
+            dropped = int(state.get("dropped", 0))
+            picked = int(state.get("picked", 0))
+            missed = int(state.get("missed", 0))
+            pending = self._pending_drop_count(item_key)
+            total_dropped += dropped
+            total_picked += picked
+            total_missed += missed
+            total_pending += pending
+            rows.append((item_key, str(state.get("name") or "(unknown)"), dropped, picked, missed, pending))
+
+        rows.sort(key=lambda row: (-row[2], -row[4], row[1].casefold()))
+        summary_text = f"Dropped: {total_dropped} | Picked: {total_picked} | Missed: {total_missed} | Pending: {total_pending}"
+        self._set_label_cached("drops:summary", self.session_drop_summary_label, summary_text)
+
+        existing_keys = set(self._drop_row_ids.keys())
+        tree = self.session_drop_tree
+        for item_key in existing_keys - {row[0] for row in rows}:
+            iid = self._drop_row_ids.pop(item_key, None)
+            if iid:
+                try:
+                    tree.delete(iid)
+                except Exception:
+                    pass
+
+        for item_key, display_name, dropped, picked, missed, pending in rows:
+            values = (display_name, dropped, picked, missed, pending)
+            iid = self._drop_row_ids.get(item_key)
+            if iid:
+                try:
+                    tree.item(iid, values=values)
+                except Exception:
+                    iid = None
+            if not iid:
+                iid = tree.insert("", "end", values=values)
+                self._drop_row_ids[item_key] = iid
+
+    def _reset_session_drop_tracking(self):
+        self._session_drop_started_at = time.time()
+        self._session_drop_items.clear()
+        self._session_drop_pending.clear()
+        self._drop_row_ids.clear()
+        self._drop_log_partial = ""
+        self._drop_log_path = _resolve_chat_log_path()
+        if self._drop_log_path and self._drop_log_path.is_file():
+            try:
+                self._drop_log_offset = int(self._drop_log_path.stat().st_size)
+            except Exception:
+                self._drop_log_offset = 0
+        else:
+            self._drop_log_offset = 0
+        try:
+            self.session_drop_tree.delete(*self.session_drop_tree.get_children())
+        except Exception:
+            pass
+        self._refresh_session_drops_panel()
+
+    def _finalize_pending_drops(self, now_ts: float, *, finalize_all: bool = False):
+        for item_key in list(self._session_drop_pending.keys()):
+            pending_rows = self._session_drop_pending.get(item_key, [])
+            while pending_rows:
+                entry = pending_rows[0]
+                deadline = float(entry.get("deadline", 0.0))
+                if (not finalize_all) and deadline > now_ts:
+                    break
+                pending_rows.pop(0)
+                qty = max(0, int(entry.get("qty", 0)))
+                state = self._session_drop_items.get(item_key)
+                if state is not None and qty > 0:
+                    state["missed"] = int(state.get("missed", 0)) + qty
+            if pending_rows:
+                self._session_drop_pending[item_key] = pending_rows
+            else:
+                self._session_drop_pending.pop(item_key, None)
+
+    def _record_session_drop(self, item_name: str, qty: int, now_ts: float):
+        qty = int(qty)
+        if qty <= 0:
+            return
+        item_key, state = self._ensure_session_drop_item(item_name)
+        state["dropped"] = int(state.get("dropped", 0)) + qty
+        self._session_drop_pending.setdefault(item_key, []).append(
+            {"qty": qty, "deadline": float(now_ts) + float(DROP_PICKUP_MATCH_TIMEOUT_S)}
+        )
+
+    def _record_session_pickup(self, item_name: str, qty: int):
+        qty_remaining = int(qty)
+        if qty_remaining <= 0:
+            return
+
+        item_key = _normalize_item_key(item_name)
+        pending_rows = self._session_drop_pending.get(item_key)
+        if not pending_rows:
+            return
+
+        _, state = self._ensure_session_drop_item(item_name)
+        while qty_remaining > 0 and pending_rows:
+            entry = pending_rows[0]
+            entry_qty = max(0, int(entry.get("qty", 0)))
+            if entry_qty <= 0:
+                pending_rows.pop(0)
+                continue
+            taken = min(entry_qty, qty_remaining)
+            state["picked"] = int(state.get("picked", 0)) + taken
+            entry["qty"] = entry_qty - taken
+            qty_remaining -= taken
+            if int(entry.get("qty", 0)) <= 0:
+                pending_rows.pop(0)
+
+        if pending_rows:
+            self._session_drop_pending[item_key] = pending_rows
+        else:
+            self._session_drop_pending.pop(item_key, None)
+
+    def _process_session_drop_log_line(self, raw_line: str, now_ts: float):
+        line = str(raw_line or "").strip()
+        if not line:
+            return
+        message = line.split(">", 1)[1].strip() if ">" in line else line
+
+        drop_match = DROP_MESSAGE_RE.match(message)
+        if drop_match:
+            target_player = drop_match.group(3).strip()
+            player_key = _player_name_key(self_player_name)
+            if player_key and _player_name_key(target_player) == player_key:
+                self._record_session_drop(drop_match.group(2), int(drop_match.group(1)), now_ts)
+            return
+
+        pickup_match = PICKUP_MESSAGE_RE.match(message)
+        if pickup_match:
+            self._record_session_pickup(pickup_match.group(2), int(pickup_match.group(1)))
+
+    def _poll_session_drop_log(self, now_ts: float):
+        self._finalize_pending_drops(now_ts, finalize_all=False)
+        path = self._drop_log_path
+
+        if not self._session_drop_active and not self._session_drop_items and not self._session_drop_pending:
+            if path is None or (not path.is_file()):
+                self._drop_log_path = _resolve_chat_log_path()
+            return
+
+        if path is None or (not path.is_file()):
+            self._drop_log_path = _resolve_chat_log_path()
+            path = self._drop_log_path
+            if path is None or (not path.is_file()):
+                return
+            try:
+                self._drop_log_offset = int(path.stat().st_size)
+            except Exception:
+                self._drop_log_offset = 0
+            self._drop_log_partial = ""
+            return
+
+        try:
+            file_size = int(path.stat().st_size)
+        except Exception:
+            return
+
+        if file_size < int(self._drop_log_offset):
+            self._drop_log_offset = 0
+            self._drop_log_partial = ""
+
+        try:
+            with path.open("rb") as fh:
+                fh.seek(int(self._drop_log_offset))
+                chunk = fh.read()
+                self._drop_log_offset = int(fh.tell())
+        except Exception as e:
+            _warn_throttled("drops:read", f"[DROPS] ChatLog read failed: {e}", interval_s=5.0)
+            return
+
+        if not chunk:
+            return
+
+        # Preserve a trailing partial line so we only parse completed log records.
+        text = self._drop_log_partial + chunk.decode("utf-8", errors="ignore")
+        lines = text.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._drop_log_partial = lines.pop()
+        else:
+            self._drop_log_partial = ""
+
+        for raw_line in lines:
+            self._process_session_drop_log_line(raw_line, now_ts)
+
     def _set_bool_status(self, label_widget, enabled: bool, on_text: str, off_text: str):
         self._set_label_cached(
             key=f"label:{id(label_widget)}",
@@ -6670,6 +7051,10 @@ class PlayerDataPopup:
         if now - self._last_chat_update > UI_CHAT_REFRESH_S:
             self._refresh_chat_panel()
             self._last_chat_update = now
+        if now - self._last_drop_log_update > UI_DROP_LOG_REFRESH_S:
+            self._poll_session_drop_log(now)
+            self._refresh_session_drops_panel()
+            self._last_drop_log_update = now
 
         try:
             if self._ui_running:
@@ -7051,6 +7436,8 @@ class PlayerDataPopup:
         self._session_exp_started_at = time.time()
         self._session_exp_total = 0
         self._session_exp_last_value = None
+        self._session_drop_active = True
+        self._reset_session_drop_tracking()
         self._stop_in_progress = False
         try:
             self.session_exp_label.config(text="0")
@@ -7069,6 +7456,9 @@ class PlayerDataPopup:
 
         def _apply_stopped_ui():
             try:
+                self._session_drop_active = False
+                self._finalize_pending_drops(time.time(), finalize_all=True)
+                self._refresh_session_drops_panel()
                 self._set_bot_ui_state(False)
             except Exception:
                 pass

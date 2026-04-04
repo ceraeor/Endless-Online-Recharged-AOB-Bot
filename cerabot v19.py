@@ -40,7 +40,7 @@ pyautogui.PAUSE = 0
 
 NPC_AOB    = "66 89 90 A0 00 00 00"
 npcAddress = None
-WALK_AOB = "BA 02 00 00 00 89 41 08 8D 85 F4 FD FF FF"
+WALK_AOB = "BA 02 00 00 00 89 41 08 8D 85 ?? ?? FF FF"
 walkAddress = None
 DIRECTIONAL_AOB = "88 53 56 8B 0D ?? ?? ?? ?? 8B 01 8B 90 ?? ?? 00 00"
 directionalAddress = None
